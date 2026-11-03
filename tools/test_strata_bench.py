@@ -2,6 +2,8 @@
 writing and the comparison.  Light: no GPU, no Strata server, a few seconds."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -10,7 +12,7 @@ import threading
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import strata_bench as B  # noqa: E402
@@ -184,6 +186,30 @@ class RedactionTests(unittest.TestCase):
         if len(user) >= 4:
             self.assertNotIn(user, red(f"hello {user} world"))
 
+    def test_a_folder_under_a_short_home_keeps_its_own_placeholder(self):
+        # issue #3326 with a fixed machine (user name "dgbox", the repository directly under the home folder):
+        # a name is wrapped in word bounds, which makes its pattern longer than the pattern of the folder
+        # holding it, so the name won and the report kept the folder layout instead of <strata> and <home>.
+        def red(root, home, user, host, tmp):
+            with mock.patch.object(B, "ROOT", root), mock.patch.object(B.Path, "home", return_value=home), \
+                 mock.patch.object(B.getpass, "getuser", return_value=user), \
+                 mock.patch.object(B.socket, "gethostname", return_value=host), \
+                 mock.patch.object(B.platform, "node", return_value=host), \
+                 mock.patch.object(B.tempfile, "gettempdir", return_value=tmp):
+                return B.redactor()
+
+        linux = red(PurePosixPath("/home/dgbox/Strata"), PurePosixPath("/home/dgbox"), "dgbox", "dgbox-ubuntu-server", "/tmp")
+        self.assertEqual(linux("loading /home/dgbox/Strata/strata-x.json"), "loading <strata>/strata-x.json")
+        self.assertEqual(linux("dgbox-ubuntu-server wrote /home/dgbox/Strata/bench/results/run/results.json"),
+                         "<host> wrote <strata>/bench/results/run/results.json")
+        self.assertEqual(linux("in /home/dgbox/data"), "in <home>/data")
+        self.assertEqual(linux("hello dgbox world"), "hello <user> world")
+        self.assertEqual(linux("log /tmp/strata.log"), "log <tmp>/strata.log")
+        win = red(PureWindowsPath(r"C:\Users\dgbox\Strata"), PureWindowsPath(r"C:\Users\dgbox"), "dgbox", "dgbox-pc",
+                  r"C:\Users\dgbox\AppData\Local\Temp")
+        self.assertEqual(win(r"in C:\Users\dgbox\data"), r"in <home>\data")
+        self.assertEqual(win(r"loading C:\Users\dgbox\Strata\strata-x.json"), r"loading <strata>\strata-x.json")
+
     def test_objects_are_redacted_deeply(self):
         red = B.redactor()
         out = B.redact_obj({"a": [{"p": r"D:\Users\zed\x"}], "n": 3}, red)
@@ -255,6 +281,96 @@ class ReportTests(unittest.TestCase):
             self.assertIn("+100.0%", table)
             self.assertIn("engine: 1.0 -> 9.9.9", table)
 
+    def test_only_the_gpus_the_engine_uses_are_listed(self):
+        """#1985: a PC with two cards, the engine on one: the report names that one, with its VRAM."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        two = {"gpus": [{"name": "NVIDIA GeForce RTX 3060", "vram_mib": 12288, "driver": "560.1"},
+                        {"name": "NVIDIA GeForce RTX 9999", "vram_mib": 16384, "driver": "560.1"}]}
+        with mock.patch.object(B, "gpu_info_local", return_value=two):
+            m = B.collect_machine(srv.base, "", {"gpu": 1})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
+            m = B.collect_machine(srv.base, "", {"gpu": [0, 1]})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 3060", "NVIDIA GeForce RTX 9999"], 28672))
+            m = B.collect_machine(srv.base, "", {"gpu": "0"}, "1")            # the bench's own --gpu wins
+            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 9999"])
+            m = B.collect_machine(srv.base, "", {"args": ["--gpu", "0"]})
+            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 3060"])
+            # nothing selected: one card, the one the server reports (not every card of the PC)
+            m = B.collect_machine(srv.base, "", {})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
+        self.assertEqual(B.gpu_selection({"gpu": "0,2"}), [0, 2])
+        self.assertEqual(B.gpu_selection({}, None), [])
+
+    def test_the_slug_names_mixed_cards_one_by_one(self):
+        """#2062: two different cards are not N copies of the first."""
+        a, b = "NVIDIA GeForce RTX 5070 Ti", "NVIDIA RTX A4000"
+        self.assertEqual(B.gpu_slug({"gpu": [a]}), "rtx-5070-ti")
+        self.assertEqual(B.gpu_slug({"gpu": [a, b]}), "rtx-5070-ti-plus-rtx-a4000")
+        self.assertEqual(B.gpu_slug({"gpu": [b, a]}), "rtx-a4000-plus-rtx-5070-ti")
+        self.assertEqual(B.gpu_slug({"gpu": [b, b]}), "2x-rtx-a4000")
+        self.assertEqual(B.gpu_slug({"gpu": [b, a, b]}), "2x-rtx-a4000-plus-rtx-5070-ti")
+
+    def test_a_card_the_pc_s_nvidia_smi_does_not_list_is_the_servers_own(self):
+        """#2001: the engine on an Intel Arc beside a GeForce: the report names the Arc (the name the server reads)."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        nv = {"gpus": [{"name": "NVIDIA GeForce RTX 3080 Ti", "vram_mib": 12288, "driver": "560.1"}], "cuda": "12.6"}
+        with mock.patch.object(B, "gpu_info_local", return_value=nv), mock.patch.object(
+                B, "try_json", side_effect=lambda base, path, *a, **k: (
+                    {"hardware_static": {"gpu_name": "Intel Arc Pro B70"}} if path == "/metrics" else {})):
+            m = B.collect_machine(srv.base, "", {"backend": "sycl"})
+        self.assertEqual((m["gpu"], m["cuda"]), (["Intel Arc Pro B70"], None))
+
+    def test_the_report_labels_the_driver_s_cuda_and_the_engine_s_build(self):
+        """#2111: the CUDA line was the driver's ceiling read as the engine's toolkit, and storage said "not measured"."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        nv = {"gpus": [{"name": "NVIDIA GeForce RTX 9999", "vram_mib": 16384, "driver": "616.92",
+                        "power_limit_w": "165.00", "power_draw_w": "20.25", "pcie": "gen4 x8",
+                        "pstate": "P3", "temp_c": "45"}], "cuda": "13.4"}
+        with mock.patch.object(B, "gpu_info_local", return_value=nv), mock.patch.object(
+                B, "storage_info", return_value="Samsung SSD 990 EVO Plus 2TB SSD/NVMe"), mock.patch.object(
+                B, "engine_build", return_value={"version": "0.1.43", "cuda": "13.0"}):
+            with tempfile.TemporaryDirectory() as d:
+                self.assertEqual(self.run_main(srv, d), 0)
+                readme = next(Path(d).iterdir()).joinpath("README.md").read_text(encoding="utf-8")
+        for part in ("CUDA (driver supports up to): 13.4; engine built for CUDA 13.0",
+                     "storage: Samsung SSD 990 EVO Plus 2TB SSD/NVMe",
+                     "GPU detail (after the run, near idle): power_limit_w=165.00, power_draw_w=20.25, "
+                     "pcie=gen4 x8, pstate=P3, temp_c=45",
+                     "Background workloads: not recorded (GPU power limit/draw read above)"):
+            self.assertIn(part, readme)
+        self.assertNotIn("storage: not measured", readme)
+
+    def test_a_bench_server_never_saves_over_the_users_profile(self):
+        """#2088: --expert-profile-save writes the profile at quit; the bench's own server runs without it."""
+        cfg = {"args": ["--expert-profile", "p.bin", "--expert-profile-save", "p.bin", "--spec", "4"]}
+        safe, removed = B.without_profile_save(cfg)
+        self.assertTrue(removed)
+        self.assertEqual(safe["args"], ["--expert-profile", "p.bin", "--spec", "4"])
+        self.assertEqual(cfg["args"][3], "p.bin")                       # the input is not changed
+        safe, removed = B.without_profile_save({"args": ["--expert-profile-save=p.bin", "--spec", "4"]})
+        self.assertEqual((safe["args"], removed), (["--spec", "4"], True))
+        same = {"args": ["--spec", "4"]}
+        self.assertEqual(B.without_profile_save(same), (same, False))
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            c = Path(d) / "strata-x.json"
+            c.write_text(json.dumps(cfg))
+            with mock.patch.object(B.subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()):
+                B.start_server(c, 8080, None, Path(d) / "run.log")
+            used = Path(popen.call_args[0][0][popen.call_args[0][0].index("--config") + 1])
+            self.assertNotIn("--expert-profile-save", json.loads(used.read_text())["args"])
+            self.assertIn("--expert-profile-save", json.loads(c.read_text())["args"])   # the user's file is as it was
+
+    def test_an_attached_server_is_not_stopped(self):
+        """#2088: with --url the bench only reads; the server it did not start keeps running."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(B, "stop_server") as stop:
+            self.assertEqual(self.run_main(srv, d), 0)
+        stop.assert_not_called()
+
     def test_names(self):
         m = {"gpu": ["NVIDIA GeForce RTX 3060"], "model": "Qwen3.8 Flash-Next", "quant": "IQ3_XXS"}
         self.assertEqual(B.results_dir_name(m, "2026-10-10"), "2026-10-10-community-rtx-3060-qwen3-8-flash-next-iq3-xxs")
@@ -267,6 +383,51 @@ class ReportTests(unittest.TestCase):
 
     def test_no_server_is_an_error_not_a_crash(self):
         self.assertEqual(B.main(["--url", "http://127.0.0.1:9", "--quiet"]), 2)
+
+    def test_project_version_does_not_use_the_locale_code_page(self):
+        # #2792: on Windows a text file read without an encoding is decoded with the locale's code page, and CMakeLists.txt
+        # is UTF-8 with non-ASCII text.  Path.read_text here defaults to each Windows ANSI code page in turn.
+        original = Path.read_text
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "CMakeLists.txt").write_bytes(
+                "cmake_minimum_required(VERSION 3.24)\n# notes — § €\nproject(strata VERSION 9.8.7 LANGUAGES CXX)\n"
+                .encode("utf-8"))
+            for code_page in ("cp874", "cp932", "cp936", "cp949", "cp950", "cp1250", "cp1251", "cp1252", "cp1253",
+                              "cp1254", "cp1255", "cp1256", "cp1257", "cp1258"):
+                def locale_default(self, encoding=None, errors=None, **kw):
+                    return original(self, encoding=encoding or code_page, errors=errors, **kw)
+
+                with self.subTest(code_page=code_page), mock.patch.object(B, "ROOT", root), \
+                        mock.patch.object(Path, "read_text", locale_default):
+                    self.assertEqual(B.project_version(), "9.8.7")
+
+
+class MachineDetailTests(unittest.TestCase):
+    """#2111: what the report reads straight from nvidia-smi on the PC."""
+
+    ROW = "NVIDIA GeForce RTX 4060 Ti, 16380, 616.92, 165.00, 20.25, 4, 8, P3, 45"
+
+    @staticmethod
+    def queries(cmd) -> bool:
+        return any(str(c).startswith("--query-gpu") for c in cmd)
+
+    def test_cuda_header_in_both_forms(self):
+        """Current drivers print "CUDA UMD Version: 13.4"; the old "CUDA Version:" line still has to be read."""
+        for head, want in (("Some header\n\nCUDA UMD Version: 13.4\n", "13.4"),
+                           ("Some header\n\nCUDA Version: 12.6\n", "12.6")):
+            def fake(cmd, *a, _head=head, **k):
+                return self.ROW if self.queries(cmd) else _head
+            with mock.patch.object(B, "run_cmd", side_effect=fake):
+                info = B.gpu_info_local()
+            self.assertEqual((info["cuda"], info["gpus"][0]["power_limit_w"]), (want, "165.00"))
+
+    def test_power_pcie_pstate_and_temperature_are_read(self):
+        with mock.patch.object(B, "run_cmd",
+                               side_effect=lambda cmd, *a, **k: self.ROW if self.queries(cmd) else ""):
+            g = B.gpu_info_local()["gpus"][0]
+        self.assertEqual((g["name"], g["vram_mib"], g["driver"]), ("NVIDIA GeForce RTX 4060 Ti", 16380, "616.92"))
+        self.assertEqual((g["power_limit_w"], g["pcie"], g["pstate"], g["temp_c"]), ("165.00", "gen4 x8", "P3", "45"))
 
 
 if __name__ == "__main__":
